@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Local secrets / env
+.env
+.env.*
+
+# Workspace helper mounts
+.agents/
+.codex/
+.git/
+
+# OS
+.DS_Store

@@ -1,0 +1,1071 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+cx - Codex 接入点 / provider 管理工具
+
+功能：
+- 交互式上下键选择：切换提供商、管理提供商、切换模型
+- 添加/编辑/删除 provider：base_url、api_key、wire_api(response 格式)、默认模型
+- 自动补齐 /v1；自动 GET /v1/models；可选择模型并测试连通性
+- 切换时仅替换 ~/.codex/config.toml 的 base_url 和 ~/.codex/auth.json 的 OPENAI_API_KEY
+- cx --start-codex --provider N 自动切换并启动 codex
+- 默认为启动 codex / 联通测试设置代理 http://192.168.3.54:7893；--no-proxy 禁用
+"""
+from __future__ import annotations
+
+import argparse
+import curses
+import json
+import locale
+import os
+import re
+import shutil
+import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+DEFAULT_PROXY = "http://192.168.3.54:7893"
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
+STORE_PATH = CODEX_HOME / "providers.json"
+CONFIG_PATH = CODEX_HOME / "config.toml"
+AUTH_PATH = CODEX_HOME / "auth.json"
+
+VALID_WIRE_APIS = ("responses", "chat")
+
+
+class CXError(Exception):
+    pass
+
+
+def ensure_codex_home() -> None:
+    CODEX_HOME.mkdir(parents=True, exist_ok=True)
+
+
+def redact(s: str, keep: int = 4) -> str:
+    if not s:
+        return ""
+    if len(s) <= keep * 2:
+        return "*" * len(s)
+    return f"{s[:keep]}…{s[-keep:]}"
+
+
+def normalize_base_url(raw: str) -> str:
+    """Normalize provider base URL for Codex config.
+
+    Codex needs the API root including /v1.  Accept either a host/root URL or a
+    URL already ending in /v1, and return exactly one trailing /v1 endpoint.
+    """
+    url = (raw or "").strip()
+    if not url:
+        raise CXError("base_url 不能为空")
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url):
+        url = "https://" + url
+    url = url.rstrip("/")
+    parsed = urllib.parse.urlsplit(url)
+    if not parsed.scheme or not parsed.netloc:
+        raise CXError(f"base_url 无效: {raw}")
+    path = parsed.path.rstrip("/")
+    # Add exactly one trailing /v1. Preserve nested prefixes:
+    #   https://host/openai   -> https://host/openai/v1
+    #   https://host/openai/v1 -> https://host/openai/v1
+    if path.lower() == "/v1":
+        path = "/v1"
+    elif path.lower().endswith("/v1"):
+        path = path[:-3].rstrip("/") + "/v1"
+    else:
+        path = (path.rstrip("/") + "/v1") if path else "/v1"
+    normalized = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+    return normalized.rstrip("/")
+
+
+def api_url(base_url: str, endpoint: str) -> str:
+    endpoint = endpoint if endpoint.startswith("/") else "/" + endpoint
+    return normalize_base_url(base_url).rstrip("/") + endpoint
+
+
+def provider_id(name: str, existing: Sequence[Dict[str, Any]], current_id: Optional[str] = None) -> str:
+    base = re.sub(r"[^a-zA-Z0-9_-]+", "-", (name or "provider").strip().lower()).strip("-") or "provider"
+    pid = base[:48]
+    used = {p.get("id") for p in existing if p.get("id") != current_id}
+    if pid not in used:
+        return pid
+    i = 2
+    while f"{pid}-{i}" in used:
+        i += 1
+    return f"{pid}-{i}"
+
+
+def load_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise CXError(f"读取 {path} 失败: {e}")
+
+
+def atomic_write(path: Path, data: str, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    tmp.write_text(data, encoding="utf-8")
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def load_store() -> Dict[str, Any]:
+    ensure_codex_home()
+    data = load_json(STORE_PATH, {"version": 1, "providers": []})
+    if not isinstance(data, dict):
+        data = {"version": 1, "providers": []}
+    providers = data.get("providers")
+    if not isinstance(providers, list):
+        data["providers"] = []
+    changed = import_current_provider_if_empty(data)
+    if changed:
+        save_store(data)
+    return data
+
+
+def save_store(data: Dict[str, Any]) -> None:
+    ensure_codex_home()
+    data["version"] = 1
+    atomic_write(STORE_PATH, json.dumps(data, ensure_ascii=False, indent=2) + "\n", 0o600)
+
+
+def current_auth_key() -> str:
+    data = load_json(AUTH_PATH, {})
+    if isinstance(data, dict):
+        return str(data.get("OPENAI_API_KEY") or data.get("api_key") or "")
+    return ""
+
+
+def parse_toml_basic_string(raw: str) -> str:
+    raw = (raw or "").strip()
+    if raw.startswith('"') and raw.endswith('"'):
+        try:
+            return json.loads(raw)
+        except Exception:
+            return raw[1:-1]
+    return raw.strip()
+
+
+def current_model_provider_id_from_text(text: str) -> str:
+    m = re.search(
+        r'^\s*model_provider\s*=\s*("(?:(?:\\.)|[^"\\])*"|[^#\s]+)\s*(?:#.*)?$',
+        text,
+        flags=re.M,
+    )
+    return parse_toml_basic_string(m.group(1)) if m else ""
+
+
+def current_model_from_text(text: str) -> str:
+    # Only read top-level model before the first TOML table.
+    top = text.split("\n[", 1)[0]
+    m = re.search(
+        r'^\s*model\s*=\s*("(?:(?:\\.)|[^"\\])*"|[^#\s]+)\s*(?:#.*)?$',
+        top,
+        flags=re.M,
+    )
+    return parse_toml_basic_string(m.group(1)) if m else ""
+
+
+def current_config_model() -> str:
+    if not CONFIG_PATH.exists():
+        return ""
+    return current_model_from_text(CONFIG_PATH.read_text(encoding="utf-8", errors="replace"))
+
+
+def parse_current_config_provider() -> Optional[Dict[str, str]]:
+    if not CONFIG_PATH.exists():
+        return None
+    text = CONFIG_PATH.read_text(encoding="utf-8", errors="replace")
+
+    top_provider = current_model_provider_id_from_text(text) or None
+    top_model = None
+    m = re.search(r'^\s*model\s*=\s*"([^"]+)"\s*$', text, flags=re.M)
+    if m:
+        top_model = m.group(1)
+    if not top_provider:
+        return None
+
+    # Locate [model_providers.<id>] or [model_providers."id"]
+    pat = re.compile(r'^\s*\[model_providers\.(?:"([^"]+)"|([^\]]+))\]\s*$', re.M)
+    for mm in pat.finditer(text):
+        pid = (mm.group(1) or mm.group(2) or "").strip()
+        if pid != top_provider:
+            continue
+        start = mm.end()
+        next_m = re.search(r'^\s*\[', text[start:], flags=re.M)
+        end = start + next_m.start() if next_m else len(text)
+        body = text[start:end]
+        vals = {}
+        for key in ("name", "base_url", "wire_api"):
+            km = re.search(rf'^\s*{re.escape(key)}\s*=\s*"([^"]*)"\s*$', body, flags=re.M)
+            if km:
+                vals[key] = km.group(1)
+        return {
+            "id": top_provider,
+            "name": vals.get("name") or top_provider,
+            "base_url": vals.get("base_url") or "",
+            "wire_api": vals.get("wire_api") or "responses",
+            "default_model": top_model or "",
+        }
+    return None
+
+
+def import_current_provider_if_empty(data: Dict[str, Any]) -> bool:
+    providers = data.setdefault("providers", [])
+    if providers:
+        return False
+    cur = parse_current_config_provider()
+    if not cur or not cur.get("base_url"):
+        return False
+    cur["base_url"] = normalize_base_url(cur["base_url"])
+    cur["api_key"] = current_auth_key()
+    cur["created_at"] = time.time()
+    cur["updated_at"] = time.time()
+    cur["models_cache"] = []
+    providers.append(cur)
+    data["active_provider_id"] = cur["id"]
+    return True
+
+
+def toml_quote(s: str) -> str:
+    return json.dumps(str(s), ensure_ascii=False)
+
+
+
+def model_provider_sections(text: str) -> List[Tuple[str, int, int]]:
+    """Return (provider_id, body_start, body_end) for model provider sections."""
+    header_re = re.compile(
+        r'^\s*\[model_providers\.(?:"((?:[^"\\]|\\.)*)"|([^\]\r\n]+))\]\s*(?:#.*)?$',
+        re.M,
+    )
+    matches = list(header_re.finditer(text))
+    out: List[Tuple[str, int, int]] = []
+    for i, m in enumerate(matches):
+        raw_quoted, raw_plain = m.group(1), m.group(2)
+        if raw_quoted is not None:
+            try:
+                pid = json.loads('"' + raw_quoted + '"')
+            except Exception:
+                pid = raw_quoted
+        else:
+            pid = (raw_plain or "").strip()
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        # Stop at any next TOML table, not only the next model provider section.
+        next_table = re.search(r'^\s*\[', text[start:end], flags=re.M)
+        if next_table:
+            end = start + next_table.start()
+        out.append((pid, start, end))
+    return out
+
+
+def section_has_base_url(text: str, start: int, end: int) -> bool:
+    return re.search(r'^\s*base_url\s*=', text[start:end], flags=re.M) is not None
+
+
+def replace_base_url_in_section(text: str, start: int, end: int, base_url: str) -> str:
+    """Replace only the TOML value of base_url in one section; preserve all else."""
+    body = text[start:end]
+    m = re.search(
+        r'^([ \t]*base_url[ \t]*=[ \t]*)("(?:(?:\\.)|[^"\\])*"|[^#\r\n]*?)([ \t]*(?:#.*)?(?:\r?\n|$))',
+        body,
+        flags=re.M,
+    )
+    if not m:
+        raise CXError("当前 config.toml 的 provider section 中找不到 base_url，已停止以避免修改其它内容")
+    new_body = body[:m.start(2)] + toml_quote(base_url) + body[m.end(2):]
+    return text[:start] + new_body + text[end:]
+
+
+def update_config_base_url_only(base_url: str) -> None:
+    """Switch endpoint by changing only config.toml's active provider base_url value."""
+    if not CONFIG_PATH.exists():
+        raise CXError(f"找不到 {CONFIG_PATH}，无法只替换 base_url")
+    text = CONFIG_PATH.read_text(encoding="utf-8", errors="replace")
+    active_pid = current_model_provider_id_from_text(text)
+    sections = model_provider_sections(text)
+    target: Optional[Tuple[str, int, int]] = None
+    if active_pid:
+        for sec in sections:
+            if sec[0] == active_pid and section_has_base_url(text, sec[1], sec[2]):
+                target = sec
+                break
+    if target is None:
+        # Fallback: if the active provider cannot be resolved, modify the first
+        # model_providers section that already has base_url.  We still do not add
+        # new keys or sections.
+        for sec in sections:
+            if section_has_base_url(text, sec[1], sec[2]):
+                target = sec
+                break
+    if target is None:
+        raise CXError("config.toml 中没有可替换的 [model_providers.*] base_url")
+    new_text = replace_base_url_in_section(text, target[1], target[2], base_url)
+    if new_text != text:
+        atomic_write(CONFIG_PATH, new_text, 0o600)
+
+
+def update_config_model_only(model: str) -> None:
+    """Replace only the top-level model value in config.toml."""
+    model = (model or "").strip()
+    if not model:
+        raise CXError("模型名不能为空")
+    if not CONFIG_PATH.exists():
+        raise CXError(f"找不到 {CONFIG_PATH}，无法切换模型")
+    text = CONFIG_PATH.read_text(encoding="utf-8", errors="replace")
+    top_end = text.find("\n[")
+    if top_end == -1:
+        top_end = len(text)
+    top = text[:top_end]
+    m = re.search(
+        r'^([ \t]*model[ \t]*=[ \t]*)("(?:(?:\\.)|[^"\\])*"|[^#\r\n]*?)([ \t]*(?:#.*)?(?:\r?\n|$))',
+        top,
+        flags=re.M,
+    )
+    if m:
+        new_top = top[:m.start(2)] + toml_quote(model) + top[m.end(2):]
+        new_text = new_top + text[top_end:]
+    else:
+        insert = f"model = {toml_quote(model)}\n"
+        new_text = insert + text
+    if new_text != text:
+        atomic_write(CONFIG_PATH, new_text, 0o600)
+
+
+def update_auth_openai_api_key_only(api_key: str) -> None:
+    """Update only the OPENAI_API_KEY JSON string when it already exists."""
+    if AUTH_PATH.exists():
+        text = AUTH_PATH.read_text(encoding="utf-8", errors="replace")
+        m = re.search(r'("OPENAI_API_KEY"\s*:\s*)"(?:[^"\\]|\\.)*"', text)
+        if m:
+            new_text = text[:m.start(0)] + m.group(1) + toml_quote(api_key) + text[m.end(0):]
+            if new_text != text:
+                atomic_write(AUTH_PATH, new_text, 0o600)
+            return
+        data = load_json(AUTH_PATH, {})
+        if not isinstance(data, dict):
+            raise CXError(f"{AUTH_PATH} 不是 JSON object，无法只更新 OPENAI_API_KEY")
+    else:
+        data = {}
+    # If the key is missing, adding it is unavoidable. Preserve other JSON keys.
+    data["OPENAI_API_KEY"] = api_key
+    atomic_write(AUTH_PATH, json.dumps(data, ensure_ascii=False, indent=2) + "\n", 0o600)
+
+
+def detected_active_provider_id(store: Dict[str, Any]) -> str:
+    """Compute active provider by comparing current Codex base_url/API key; no writes."""
+    cur = parse_current_config_provider()
+    if not cur:
+        return ""
+    try:
+        cur_base = normalize_base_url(cur.get("base_url") or "")
+    except Exception:
+        cur_base = cur.get("base_url") or ""
+    cur_key = current_auth_key()
+    providers = store.get("providers") or []
+    for p0 in providers:
+        try:
+            p_base = normalize_base_url(p0.get("base_url") or "")
+        except Exception:
+            p_base = p0.get("base_url") or ""
+        if p_base == cur_base and (p0.get("api_key") or "") == cur_key:
+            return p0.get("id") or ""
+    for p0 in providers:
+        try:
+            p_base = normalize_base_url(p0.get("base_url") or "")
+        except Exception:
+            p_base = p0.get("base_url") or ""
+        if p_base == cur_base:
+            return p0.get("id") or ""
+    return ""
+
+
+def switch_provider(provider: Dict[str, Any], model: Optional[str] = None) -> None:
+    ensure_codex_home()
+    base_url = normalize_base_url(provider.get("base_url") or "")
+    api_key = provider.get("api_key") or ""
+    if not api_key:
+        raise CXError("该 provider 没有 api_key")
+
+    # IMPORTANT: per requirement, switching providers must only modify:
+    #   1) /root/.codex/auth.json     -> OPENAI_API_KEY value
+    #   2) /root/.codex/config.toml   -> existing base_url value
+    # It must not change model/model_provider/wire_api or add/remove sections.
+    update_auth_openai_api_key_only(api_key)
+    update_config_base_url_only(base_url)
+
+
+def proxy_env(no_proxy: bool = False, base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    env = dict(base if base is not None else os.environ)
+    keys = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]
+    if no_proxy:
+        for k in keys:
+            env.pop(k, None)
+        return env
+    for k in keys:
+        env[k] = DEFAULT_PROXY
+    env.setdefault("NO_PROXY", "127.0.0.1,localhost,::1")
+    env.setdefault("no_proxy", "127.0.0.1,localhost,::1")
+    return env
+
+
+def urllib_opener(no_proxy: bool) -> urllib.request.OpenerDirector:
+    if no_proxy:
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener(urllib.request.ProxyHandler({
+        "http": DEFAULT_PROXY,
+        "https": DEFAULT_PROXY,
+    }))
+
+
+def http_json(method: str, url: str, api_key: str, body: Optional[Dict[str, Any]] = None,
+              timeout: int = 20, no_proxy: bool = False) -> Tuple[int, Dict[str, Any], str]:
+    data = None
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "cx-provider-manager/1.0",
+        "Authorization": f"Bearer {api_key}",
+    }
+    if body is not None:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
+    opener = urllib_opener(no_proxy)
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            try:
+                js = json.loads(raw) if raw else {}
+            except Exception:
+                js = {}
+            return resp.status, js, raw
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        try:
+            js = json.loads(raw) if raw else {}
+        except Exception:
+            js = {}
+        return e.code, js, raw
+    except Exception as e:
+        raise CXError(str(e))
+
+
+def fetch_models(base_url: str, api_key: str, no_proxy: bool = False) -> List[str]:
+    url = api_url(base_url, "/models")
+    status, js, raw = http_json("GET", url, api_key, timeout=25, no_proxy=no_proxy)
+    if status < 200 or status >= 300:
+        msg = ""
+        if isinstance(js, dict):
+            err = js.get("error")
+            if isinstance(err, dict):
+                msg = err.get("message") or str(err)
+            elif err:
+                msg = str(err)
+        raise CXError(f"GET /v1/models 失败: HTTP {status} {msg or raw[:200]}")
+    data = js.get("data") if isinstance(js, dict) else None
+    models: List[str] = []
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and item.get("id"):
+                models.append(str(item["id"]))
+            elif isinstance(item, str):
+                models.append(item)
+    # De-duplicate while preserving order.
+    seen = set()
+    out = []
+    for m in models:
+        if m not in seen:
+            out.append(m)
+            seen.add(m)
+    return out
+
+
+def test_model(base_url: str, api_key: str, model: str, wire_api: str, no_proxy: bool = False) -> str:
+    if not model:
+        raise CXError("模型不能为空")
+    if wire_api == "chat":
+        url = api_url(base_url, "/chat/completions")
+        body = {
+            "model": model,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 8,
+        }
+    else:
+        url = api_url(base_url, "/responses")
+        body = {
+            "model": model,
+            "input": "ping",
+            "max_output_tokens": 8,
+        }
+    status, js, raw = http_json("POST", url, api_key, body=body, timeout=35, no_proxy=no_proxy)
+    if 200 <= status < 300:
+        return f"HTTP {status} OK"
+    msg = ""
+    if isinstance(js, dict):
+        err = js.get("error")
+        if isinstance(err, dict):
+            msg = err.get("message") or str(err)
+        elif err:
+            msg = str(err)
+    raise CXError(f"HTTP {status} {msg or raw[:300]}")
+
+
+# -------------------------- curses UI helpers --------------------------
+
+
+def char_display_width(ch: str) -> int:
+    if not ch:
+        return 0
+    if unicodedata.combining(ch):
+        return 0
+    if ch == "\t":
+        return 4
+    if ord(ch) < 32 or 0x7F <= ord(ch) < 0xA0:
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("F", "W") else 1
+
+
+def display_width(s: str) -> int:
+    return sum(char_display_width(ch) for ch in str(s))
+
+
+def crop_display(s: str, max_width: int) -> str:
+    if max_width <= 0:
+        return ""
+    out: List[str] = []
+    used = 0
+    for ch in str(s).replace("\t", "    "):
+        if ch in "\r\n":
+            break
+        cw = char_display_width(ch)
+        if used + cw > max_width:
+            break
+        out.append(ch)
+        used += cw
+    return "".join(out)
+
+
+def wrap_lines_display(s: str, width: int) -> List[str]:
+    width = max(10, width)
+    lines: List[str] = []
+    for part in str(s).splitlines() or [""]:
+        part = part.replace("\t", "    ")
+        if not part:
+            lines.append("")
+            continue
+        cur: List[str] = []
+        used = 0
+        for ch in part:
+            cw = char_display_width(ch)
+            if cur and used + cw > width:
+                lines.append("".join(cur))
+                cur = [ch]
+                used = cw
+            else:
+                cur.append(ch)
+                used += cw
+        if cur:
+            lines.append("".join(cur))
+    return lines
+
+
+def safe_addstr(stdscr: Any, y: int, x: int, s: str, attr: int = 0) -> None:
+    try:
+        h, w = stdscr.getmaxyx()
+        if y < 0 or y >= h or x >= w:
+            return
+        max_width = max(0, w - x - 1)
+        stdscr.addstr(y, x, crop_display(s, max_width), attr)
+    except curses.error:
+        pass
+
+
+def wrap_lines(s: str, width: int) -> List[str]:
+    return wrap_lines_display(s, width)
+
+
+def message(stdscr: Any, title: str, body: str = "", pause: bool = True) -> None:
+    stdscr.clear()
+    safe_addstr(stdscr, 1, 2, title, curses.A_BOLD)
+    y = 3
+    h, w = stdscr.getmaxyx()
+    for line in wrap_lines(body, w - 4):
+        if y >= h - 2:
+            break
+        safe_addstr(stdscr, y, 2, line)
+        y += 1
+    if pause:
+        safe_addstr(stdscr, h - 2, 2, "按任意键继续…", curses.A_DIM)
+        stdscr.getch()
+
+
+def select_menu(stdscr: Any, title: str, options: Sequence[str], subtitle: str = "") -> Optional[int]:
+    idx = 0
+    offset = 0
+    curses.curs_set(0)
+    while True:
+        stdscr.clear()
+        h, w = stdscr.getmaxyx()
+        safe_addstr(stdscr, 1, 2, title, curses.A_BOLD)
+        subtitle_lines: List[str] = []
+        if subtitle:
+            # subtitle/body may contain Chinese and multiple lines (e.g. test
+            # connectivity confirmation). Render it explicitly so it won't push
+            # menu options into the wrong terminal columns/rows.
+            max_sub_lines = max(0, min(8, h - 8))
+            subtitle_lines = wrap_lines(subtitle, w - 4)[:max_sub_lines]
+            for n, line in enumerate(subtitle_lines):
+                safe_addstr(stdscr, 2 + n, 2, line, curses.A_DIM)
+        top = 3 + len(subtitle_lines)
+        page = max(1, h - top - 3)
+        if idx < offset:
+            offset = idx
+        if idx >= offset + page:
+            offset = idx - page + 1
+        visible = list(enumerate(options))[offset:offset + page]
+        for row, (i, opt) in enumerate(visible):
+            attr = curses.A_REVERSE if i == idx else curses.A_NORMAL
+            prefix = "> " if i == idx else "  "
+            safe_addstr(stdscr, top + row, 2, prefix + opt, attr)
+        safe_addstr(stdscr, h - 2, 2, "↑/↓ 选择，Enter 确认，q/Esc 返回", curses.A_DIM)
+        ch = stdscr.getch()
+        if ch in (curses.KEY_UP, ord('k')):
+            idx = (idx - 1) % len(options) if options else 0
+        elif ch in (curses.KEY_DOWN, ord('j')):
+            idx = (idx + 1) % len(options) if options else 0
+        elif ch in (10, 13, curses.KEY_ENTER):
+            return idx if options else None
+        elif ch in (27, ord('q'), ord('Q')):
+            return None
+
+
+def prompt(stdscr: Any, label: str, default: str = "", secret: bool = False, allow_empty: bool = True) -> Optional[str]:
+    curses.curs_set(1)
+    while True:
+        stdscr.clear()
+        safe_addstr(stdscr, 1, 2, label, curses.A_BOLD)
+        if default and not secret:
+            safe_addstr(stdscr, 3, 2, f"默认: {default}", curses.A_DIM)
+        elif default and secret:
+            safe_addstr(stdscr, 3, 2, f"默认: {redact(default)}（直接回车沿用）", curses.A_DIM)
+        safe_addstr(stdscr, 5, 2, "> ")
+        stdscr.refresh()
+        if secret:
+            curses.noecho()
+        else:
+            curses.echo()
+        try:
+            raw = stdscr.getstr(5, 4, 4096)
+        except KeyboardInterrupt:
+            curses.noecho()
+            curses.curs_set(0)
+            return None
+        finally:
+            curses.noecho()
+        value = raw.decode("utf-8", errors="replace").strip()
+        if value == "" and default != "":
+            value = default
+        if value or allow_empty:
+            curses.curs_set(0)
+            return value
+        message(stdscr, "输入不能为空", pause=True)
+
+
+def confirm(stdscr: Any, title: str, body: str = "") -> bool:
+    return select_menu(stdscr, title, ["是", "否"], body) == 0
+
+
+def provider_label(p: Dict[str, Any], i: int, active_id: str = "") -> str:
+    active = " *当前" if p.get("id") == active_id else ""
+    model = p.get("default_model") or "未选模型"
+    base = p.get("base_url") or ""
+    wire = p.get("wire_api") or "responses"
+    return f"{i + 1}. {p.get('name') or p.get('id')} [{wire}] model={model} base={base}{active}"
+
+
+def choose_provider(stdscr: Any, store: Dict[str, Any], title: str = "选择提供商") -> Optional[Tuple[int, Dict[str, Any]]]:
+    providers = store.get("providers") or []
+    if not providers:
+        message(stdscr, "还没有保存的提供商", "请先进入“管理提供商”添加。")
+        return None
+    active_id = detected_active_provider_id(store)
+    options = [provider_label(p, i, active_id) for i, p in enumerate(providers)]
+    idx = select_menu(stdscr, title, options)
+    if idx is None:
+        return None
+    return idx, providers[idx]
+
+
+def choose_wire_api(stdscr: Any, default: str = "responses") -> Optional[str]:
+    opts = ["responses（Codex 推荐 / OpenAI Responses API）", "chat（Chat Completions 兼容）"]
+    idx_default = 0 if default != "chat" else 1
+    idx = select_menu(stdscr, "选择 response 格式 / wire_api", opts, f"当前默认: {VALID_WIRE_APIS[idx_default]}")
+    if idx is None:
+        return None
+    return "responses" if idx == 0 else "chat"
+
+
+def choose_model(stdscr: Any, models: Sequence[str], default: str = "") -> Optional[str]:
+    opts = []
+    if default:
+        opts.append(f"沿用默认: {default}")
+    opts.extend(models)
+    opts.append("手动输入模型名…")
+    idx = select_menu(stdscr, "选择默认模型", opts, "模型来自 GET /v1/models；也可以手动输入。")
+    if idx is None:
+        return None
+    if default and idx == 0:
+        return default
+    manual_index = len(opts) - 1
+    if idx == manual_index:
+        return prompt(stdscr, "输入模型名", default=default, allow_empty=False)
+    model_idx = idx - (1 if default else 0)
+    return models[model_idx]
+
+
+def edit_provider_flow(stdscr: Any, store: Dict[str, Any], index: Optional[int], no_proxy: bool) -> None:
+    providers: List[Dict[str, Any]] = store.setdefault("providers", [])
+    old: Dict[str, Any] = providers[index] if index is not None else {}
+    is_edit = index is not None
+
+    name = prompt(stdscr, "提供商名称", default=old.get("name") or "", allow_empty=False)
+    if name is None:
+        return
+    base = prompt(stdscr, "base_url（可带或不带 /v1，会自动补齐 /v1）", default=old.get("base_url") or "", allow_empty=False)
+    if base is None:
+        return
+    try:
+        base = normalize_base_url(base)
+    except CXError as e:
+        message(stdscr, "base_url 无效", str(e))
+        return
+    key_default = old.get("api_key") or ""
+    api_key = prompt(stdscr, "api_key（隐藏输入）", default=key_default, secret=True, allow_empty=False)
+    if api_key is None:
+        return
+    wire = choose_wire_api(stdscr, old.get("wire_api") or "responses")
+    if wire is None:
+        return
+
+    models: List[str] = []
+    fetch_note = ""
+    message(stdscr, "正在获取模型", f"GET {api_url(base, '/models')}\n代理: {'禁用' if no_proxy else DEFAULT_PROXY}", pause=False)
+    try:
+        models = fetch_models(base, api_key, no_proxy=no_proxy)
+        fetch_note = f"获取到 {len(models)} 个模型。"
+    except Exception as e:
+        fetch_note = f"获取 /models 失败：{e}"
+        message(stdscr, "获取模型失败", fetch_note)
+
+    default_model = old.get("default_model") or ""
+    if models:
+        model = choose_model(stdscr, models, default=default_model)
+    else:
+        model = prompt(stdscr, "手动输入默认模型", default=default_model, allow_empty=False)
+    if model is None:
+        return
+
+    if confirm(stdscr, "是否测试连通性？", f"模型: {model}\n格式: {wire}\n{fetch_note}"):
+        endpoint = "/chat/completions" if wire == "chat" else "/responses"
+        message(stdscr, "正在测试模型", f"POST {api_url(base, endpoint)}\n代理: {'禁用' if no_proxy else DEFAULT_PROXY}", pause=False)
+        try:
+            ok = test_model(base, api_key, model, wire, no_proxy=no_proxy)
+            message(stdscr, "测试成功", ok)
+        except Exception as e:
+            if not confirm(stdscr, "测试失败，仍然保存吗？", str(e)):
+                return
+
+    # Keep the provider id stable when editing so existing saved references remain valid.
+    pid = old.get("id") if is_edit else provider_id(name, providers)
+    p = {
+        "id": pid,
+        "name": name,
+        "base_url": base,
+        "api_key": api_key,
+        "wire_api": wire,
+        "default_model": model,
+        "models_cache": models,
+        "updated_at": time.time(),
+        "created_at": old.get("created_at") or time.time(),
+    }
+    if is_edit:
+        providers[index] = p
+    else:
+        providers.append(p)
+    save_store(store)
+    message(stdscr, "已保存", provider_label(p, index if index is not None else len(providers) - 1, detected_active_provider_id(store)))
+
+
+def delete_provider_flow(stdscr: Any, store: Dict[str, Any]) -> None:
+    chosen = choose_provider(stdscr, store, "选择要删除的提供商")
+    if not chosen:
+        return
+    idx, p = chosen
+    active_id = detected_active_provider_id(store)
+    if not confirm(stdscr, "确认删除？", provider_label(p, idx, active_id)):
+        return
+    providers = store.get("providers") or []
+    providers.pop(idx)
+    if active_id == p.get("id"):
+        store["active_provider_id"] = providers[0].get("id") if providers else ""
+    save_store(store)
+    message(stdscr, "已删除")
+
+
+def refresh_models_flow(stdscr: Any, store: Dict[str, Any], no_proxy: bool) -> None:
+    chosen = choose_provider(stdscr, store, "选择要刷新模型的提供商")
+    if not chosen:
+        return
+    idx, p = chosen
+    message(stdscr, "正在获取模型", f"GET {api_url(p.get('base_url') or '', '/models')}", pause=False)
+    try:
+        models = fetch_models(p.get("base_url") or "", p.get("api_key") or "", no_proxy=no_proxy)
+        model = choose_model(stdscr, models, default=p.get("default_model") or "")
+        if model:
+            p["models_cache"] = models
+            p["default_model"] = model
+            p["updated_at"] = time.time()
+            save_store(store)
+            message(stdscr, "已刷新", f"{len(models)} 个模型；默认模型: {model}")
+    except Exception as e:
+        message(stdscr, "刷新失败", str(e))
+
+
+def test_provider_flow(stdscr: Any, store: Dict[str, Any], no_proxy: bool) -> None:
+    chosen = choose_provider(stdscr, store, "选择要测试的提供商")
+    if not chosen:
+        return
+    _, p = chosen
+    models = p.get("models_cache") or []
+    model = choose_model(stdscr, models, default=p.get("default_model") or "") if models else prompt(stdscr, "输入测试模型", default=p.get("default_model") or "", allow_empty=False)
+    if not model:
+        return
+    try:
+        wire = p.get("wire_api") or "responses"
+        endpoint = "/chat/completions" if wire == "chat" else "/responses"
+        message(stdscr, "正在测试模型", f"{p.get('name')} / {model}\nPOST {api_url(p.get('base_url') or '', endpoint)}", pause=False)
+        ok = test_model(p.get("base_url") or "", p.get("api_key") or "", model, wire, no_proxy=no_proxy)
+        message(stdscr, "测试成功", ok)
+    except Exception as e:
+        message(stdscr, "测试失败", str(e))
+
+
+def switch_flow(stdscr: Any, store: Dict[str, Any]) -> None:
+    chosen = choose_provider(stdscr, store, "切换提供商")
+    if not chosen:
+        return
+    idx, p = chosen
+    try:
+        switch_provider(p)
+        message(stdscr, "切换成功", provider_label(p, idx, p.get("id") or ""))
+    except Exception as e:
+        message(stdscr, "切换失败", str(e))
+
+
+def switch_model_flow(stdscr: Any, store: Dict[str, Any]) -> None:
+    current_model = current_config_model()
+    active_id = detected_active_provider_id(store)
+    providers = store.get("providers") or []
+    active_provider = next((p for p in providers if p.get("id") == active_id), None)
+    models: List[str] = []
+    if active_provider:
+        for m in active_provider.get("models_cache") or []:
+            if isinstance(m, str) and m and m not in models:
+                models.append(m)
+    if current_model and current_model not in models:
+        models.insert(0, current_model)
+
+    opts = []
+    for m in models:
+        suffix = " *当前" if m == current_model else ""
+        opts.append(f"{m}{suffix}")
+    opts.append("输入 custom 模型名…")
+
+    subtitle = f"当前模型: {current_model or '未设置'}"
+    if active_provider:
+        subtitle += f"\n当前提供商: {active_provider.get('name') or active_provider.get('id')}"
+    if not models:
+        subtitle += "\n没有缓存模型，直接输入 custom 模型名。"
+
+    idx = select_menu(stdscr, "切换模型", opts, subtitle)
+    if idx is None:
+        return
+    if idx == len(opts) - 1:
+        model = prompt(stdscr, "输入 custom 模型名", default=current_model, allow_empty=False)
+    else:
+        model = models[idx]
+    if not model:
+        return
+    try:
+        update_config_model_only(model)
+        message(stdscr, "模型已切换", f"model = {model}\n只修改了 {CONFIG_PATH} 顶层 model 字段。")
+    except Exception as e:
+        message(stdscr, "切换模型失败", str(e))
+
+
+def manage_flow(stdscr: Any, store: Dict[str, Any], no_proxy: bool) -> None:
+    while True:
+        opts = ["添加提供商", "编辑提供商", "删除提供商", "刷新 /models 并选择模型", "测试模型连通性", "返回"]
+        idx = select_menu(stdscr, "管理提供商", opts)
+        if idx is None or idx == 5:
+            return
+        if idx == 0:
+            edit_provider_flow(stdscr, store, None, no_proxy)
+        elif idx == 1:
+            chosen = choose_provider(stdscr, store, "选择要编辑的提供商")
+            if chosen:
+                edit_provider_flow(stdscr, store, chosen[0], no_proxy)
+        elif idx == 2:
+            delete_provider_flow(stdscr, store)
+        elif idx == 3:
+            refresh_models_flow(stdscr, store, no_proxy)
+        elif idx == 4:
+            test_provider_flow(stdscr, store, no_proxy)
+        store.update(load_store())
+
+
+def main_ui(no_proxy: bool = False) -> int:
+    locale.setlocale(locale.LC_ALL, "")
+    store = load_store()
+
+    def _run(stdscr: Any) -> int:
+        curses.use_default_colors()
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        while True:
+            providers = store.get("providers") or []
+            active_id = detected_active_provider_id(store)
+            active_name = next((p.get("name") for p in providers if p.get("id") == active_id), "未设置")
+            model_name = current_config_model() or "未设置"
+            subtitle = f"当前 provider: {active_name} | 当前模型: {model_name} | provider 数: {len(providers)} | 代理: {'禁用' if no_proxy else DEFAULT_PROXY}"
+            idx = select_menu(stdscr, "Codex 接入点管理工具 cx", ["切换提供商", "管理提供商", "切换模型", "退出"], subtitle)
+            if idx is None or idx == 3:
+                return 0
+            if idx == 0:
+                switch_flow(stdscr, store)
+            elif idx == 1:
+                manage_flow(stdscr, store, no_proxy)
+            elif idx == 2:
+                switch_model_flow(stdscr, store)
+            store.update(load_store())
+    return curses.wrapper(_run)
+
+
+# -------------------------- CLI --------------------------
+
+
+def list_providers() -> int:
+    store = load_store()
+    providers = store.get("providers") or []
+    if not providers:
+        print("没有保存的提供商。运行 cx 进入管理界面添加。")
+        return 1
+    active_id = detected_active_provider_id(store)
+    for i, p in enumerate(providers, 1):
+        active = " *" if p.get("id") == active_id else ""
+        print(f"{i}. {p.get('name') or p.get('id')} [{p.get('wire_api') or 'responses'}]{active}")
+        print(f"   id={p.get('id')} base_url={p.get('base_url')} model={p.get('default_model') or '-'} key={redact(p.get('api_key') or '')}")
+    return 0
+
+
+def provider_by_num(num: str) -> Dict[str, Any]:
+    store = load_store()
+    providers = store.get("providers") or []
+    try:
+        idx = int(str(num), 10) - 1
+    except Exception:
+        raise CXError("--provider 必须是数字，从 1 开始")
+    if idx < 0 or idx >= len(providers):
+        raise CXError(f"provider 序号不存在: {num}（当前共有 {len(providers)} 个）")
+    return providers[idx]
+
+
+def launch_codex(no_proxy: bool, passthrough: Sequence[str]) -> int:
+    codex = shutil.which("codex")
+    if not codex:
+        raise CXError("找不到 codex 命令，请先安装 Codex CLI")
+    passthrough = list(passthrough)
+    if passthrough[:1] == ["--"]:
+        passthrough = passthrough[1:]
+    env = proxy_env(no_proxy=no_proxy)
+    proxy_msg = "禁用代理" if no_proxy else f"代理 {DEFAULT_PROXY}"
+    print(f"启动 codex（{proxy_msg}）…", file=sys.stderr)
+    os.execvpe(codex, ["codex", *passthrough], env)
+    return 0
+
+
+def noninteractive_switch(provider_num: Optional[str], start_codex: bool, no_proxy: bool, passthrough: Sequence[str]) -> int:
+    if provider_num is None:
+        if start_codex:
+            # In a TTY, let user select; otherwise fail with a clear message.
+            if sys.stdin.isatty() and sys.stdout.isatty():
+                store = load_store()
+                selected_holder: Dict[str, Any] = {}
+
+                def _pick(stdscr: Any) -> int:
+                    chosen = choose_provider(stdscr, store, "选择启动 Codex 使用的提供商")
+                    if not chosen:
+                        return 1
+                    selected_holder["provider"] = chosen[1]
+                    return 0
+                code = curses.wrapper(_pick)
+                if code:
+                    return code
+                p = selected_holder["provider"]
+            else:
+                raise CXError("--start-codex 非交互模式需要 --provider N")
+        else:
+            return main_ui(no_proxy=no_proxy)
+    else:
+        p = provider_by_num(provider_num)
+
+    switch_provider(p)
+    print(f"已切换到 provider: {p.get('name') or p.get('id')}（仅更新 OPENAI_API_KEY 和 base_url）", file=sys.stderr)
+    if start_codex:
+        return launch_codex(no_proxy=no_proxy, passthrough=passthrough)
+    return 0
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="cx",
+        description="Codex 接入点 / provider 管理工具",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    p.add_argument("--start-codex", action="store_true", help="切换后直接启动 codex")
+    p.add_argument("--provider", metavar="N", help="选择第 N 个 provider（从 cx --list 查看）")
+    p.add_argument("--no-proxy", action="store_true", help="不使用默认代理，也会清理启动 codex 时的代理环境变量")
+    p.add_argument("--list", action="store_true", help="列出已保存 provider")
+    p.add_argument("--version", action="version", version="cx 1.0")
+    return p
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = build_arg_parser()
+    args, passthrough = parser.parse_known_args(argv)
+    try:
+        if args.list:
+            return list_providers()
+        if args.provider or args.start_codex:
+            return noninteractive_switch(args.provider, args.start_codex, args.no_proxy, passthrough)
+        return main_ui(no_proxy=args.no_proxy)
+    except KeyboardInterrupt:
+        print("\n已取消", file=sys.stderr)
+        return 130
+    except CXError as e:
+        print(f"cx: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
