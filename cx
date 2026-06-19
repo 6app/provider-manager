@@ -1097,9 +1097,14 @@ def launch_codex(settings: Dict[str, Any], passthrough: Sequence[str]) -> int:
     return 0
 
 
-def noninteractive_switch(provider_num: Optional[str], start_codex: bool, passthrough: Sequence[str]) -> int:
+def noninteractive_switch(provider_num: Optional[str], start_codex: bool, passthrough: Sequence[str],
+                          proxy_override: Optional[bool] = None) -> int:
     store_for_settings = load_store()
     settings = get_settings(store_for_settings)
+    if start_codex and proxy_override is not None:
+        # Temporary override for this Codex process only.  Do not persist it to
+        # ~/.codex/providers.json; the remembered setting remains unchanged.
+        settings["proxy_enabled"] = bool(proxy_override)
     if provider_num is None:
         if start_codex:
             # In a TTY, let user select; otherwise fail with a clear message.
@@ -1140,9 +1145,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--start-codex", action="store_true", help="切换后直接启动 codex")
     p.add_argument("--provider", metavar="N", help="选择第 N 个 provider（从 cx --list 查看）")
     p.add_argument("--enable-proxy", metavar="BOOL", type=parse_bool,
-                   help="启用/禁用代理并保存到设置：true/false、1/0、yes/no、on/off")
+                   help="启用/禁用代理：单独使用时保存到设置；与 --start-codex 同用时仅本次会话临时生效")
     p.add_argument("--list", action="store_true", help="列出已保存 provider")
-    p.add_argument("--version", action="version", version="cx 1.1")
+    p.add_argument("--version", action="version", version="cx 1.2")
     return p
 
 
@@ -1154,16 +1159,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             parser.error("--no-proxy 已删除，请改用 --enable-proxy true|false")
         if passthrough and not args.start_codex:
             parser.error("未知参数: " + " ".join(passthrough))
-        if args.enable_proxy is not None:
+        if args.enable_proxy is not None and not args.start_codex:
             store = load_store()
             settings = update_settings(store, proxy_enabled=args.enable_proxy)
             print(f"代理设置已保存: {proxy_label(settings)}", file=sys.stderr)
-            if not args.list and not args.provider and not args.start_codex:
+            if not args.list and not args.provider:
                 return 0
         if args.list:
             return list_providers()
         if args.provider or args.start_codex:
-            return noninteractive_switch(args.provider, args.start_codex, passthrough)
+            if args.enable_proxy is not None and args.start_codex:
+                state = "启用" if args.enable_proxy else "禁用"
+                print(f"本次 Codex 会话临时{state}代理（不保存设置）", file=sys.stderr)
+            return noninteractive_switch(args.provider, args.start_codex, passthrough,
+                                         proxy_override=args.enable_proxy if args.start_codex else None)
         return main_ui()
     except KeyboardInterrupt:
         print("\n已取消", file=sys.stderr)

@@ -65,6 +65,7 @@ model = "your-model"
 - 默认 `proxy_url = "http://127.0.0.1:7890/"`
 - `cx` 交互启动、刷新模型、测试连通性、`--start-codex` 都会读取该记忆配置
 - CLI 可用 `--enable-proxy true|false` 修改并保存代理开关
+- 当 `--enable-proxy true|false` 与 `--start-codex` 同时使用时，只对本次 Codex 会话临时生效，不会写入 `~/.codex/providers.json`
 
 ## 安装
 
@@ -124,10 +125,16 @@ cx --provider 1
 cx --start-codex --provider 1
 ```
 
-临时先保存代理开关，再启动 Codex：
+仅本次 Codex 会话临时启用代理，不保存设置：
 
 ```bash
 cx --enable-proxy true --start-codex --provider 1
+```
+
+仅本次 Codex 会话临时禁用代理，不保存设置：
+
+```bash
+cx --enable-proxy false --start-codex --provider 1
 ```
 
 透传参数给原始 `codex`：
