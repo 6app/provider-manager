@@ -4,12 +4,12 @@
 cx - Codex 接入点 / provider 管理工具
 
 功能：
-- 交互式上下键选择：切换提供商、管理提供商、切换模型
+- 交互式上下键选择：切换提供商、管理提供商、切换模型、设置
 - 添加/编辑/删除 provider：base_url、api_key、wire_api(response 格式)、默认模型
 - 自动补齐 /v1；自动 GET /v1/models；可选择模型并测试连通性
 - 切换时仅替换 ~/.codex/config.toml 的 base_url 和 ~/.codex/auth.json 的 OPENAI_API_KEY
 - cx --start-codex --provider N 自动切换并启动 codex
-- 默认为启动 codex / 联通测试设置代理 http://192.168.3.54:7893；--no-proxy 禁用
+- 代理默认地址 http://127.0.0.1:7890/，默认不启用；可在设置中记忆开关
 """
 from __future__ import annotations
 
@@ -29,7 +29,11 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-DEFAULT_PROXY = "http://192.168.3.54:7893"
+DEFAULT_PROXY = "http://127.0.0.1:7890/"
+DEFAULT_SETTINGS = {
+    "proxy_enabled": False,
+    "proxy_url": DEFAULT_PROXY,
+}
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
 STORE_PATH = CODEX_HOME / "providers.json"
 CONFIG_PATH = CODEX_HOME / "config.toml"
@@ -128,13 +132,59 @@ def load_store() -> Dict[str, Any]:
     changed = import_current_provider_if_empty(data)
     if changed:
         save_store(data)
+    # Do not force-save defaults on load; settings are persisted only when the
+    # user changes them from the Settings menu or via --enable-proxy.
+    data["settings"] = get_settings(data)
     return data
 
 
 def save_store(data: Dict[str, Any]) -> None:
     ensure_codex_home()
     data["version"] = 1
+    data["settings"] = get_settings(data)
     atomic_write(STORE_PATH, json.dumps(data, ensure_ascii=False, indent=2) + "\n", 0o600)
+
+
+def parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    v = str(value).strip().lower()
+    if v in ("1", "true", "t", "yes", "y", "on", "enable", "enabled", "启用", "是"):
+        return True
+    if v in ("0", "false", "f", "no", "n", "off", "disable", "disabled", "禁用", "否"):
+        return False
+    raise argparse.ArgumentTypeError("布尔值必须是 true/false、1/0、yes/no 或 on/off")
+
+
+def get_settings(store: Dict[str, Any]) -> Dict[str, Any]:
+    raw = store.get("settings") if isinstance(store, dict) else None
+    if not isinstance(raw, dict):
+        raw = {}
+    proxy_url = str(raw.get("proxy_url") or DEFAULT_PROXY).strip() or DEFAULT_PROXY
+    return {
+        "proxy_enabled": bool(raw.get("proxy_enabled", DEFAULT_SETTINGS["proxy_enabled"])),
+        "proxy_url": proxy_url,
+    }
+
+
+def update_settings(store: Dict[str, Any], *, proxy_enabled: Optional[bool] = None,
+                    proxy_url: Optional[str] = None) -> Dict[str, Any]:
+    settings = get_settings(store)
+    if proxy_enabled is not None:
+        settings["proxy_enabled"] = bool(proxy_enabled)
+    if proxy_url is not None:
+        value = proxy_url.strip()
+        if not value:
+            raise CXError("代理地址不能为空")
+        settings["proxy_url"] = value
+    store["settings"] = settings
+    save_store(store)
+    return settings
+
+
+def proxy_label(settings: Dict[str, Any]) -> str:
+    settings = get_settings({"settings": settings})
+    return settings["proxy_url"] if settings["proxy_enabled"] else "禁用"
 
 
 def current_auth_key() -> str:
@@ -403,31 +453,33 @@ def switch_provider(provider: Dict[str, Any], model: Optional[str] = None) -> No
     update_config_base_url_only(base_url)
 
 
-def proxy_env(no_proxy: bool = False, base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+def proxy_env(proxy_enabled: bool = False, proxy_url: str = DEFAULT_PROXY,
+              base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     env = dict(base if base is not None else os.environ)
     keys = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]
-    if no_proxy:
+    if not proxy_enabled:
         for k in keys:
             env.pop(k, None)
         return env
     for k in keys:
-        env[k] = DEFAULT_PROXY
+        env[k] = proxy_url
     env.setdefault("NO_PROXY", "127.0.0.1,localhost,::1")
     env.setdefault("no_proxy", "127.0.0.1,localhost,::1")
     return env
 
 
-def urllib_opener(no_proxy: bool) -> urllib.request.OpenerDirector:
-    if no_proxy:
+def urllib_opener(proxy_enabled: bool, proxy_url: str = DEFAULT_PROXY) -> urllib.request.OpenerDirector:
+    if not proxy_enabled:
         return urllib.request.build_opener(urllib.request.ProxyHandler({}))
     return urllib.request.build_opener(urllib.request.ProxyHandler({
-        "http": DEFAULT_PROXY,
-        "https": DEFAULT_PROXY,
+        "http": proxy_url,
+        "https": proxy_url,
     }))
 
 
 def http_json(method: str, url: str, api_key: str, body: Optional[Dict[str, Any]] = None,
-              timeout: int = 20, no_proxy: bool = False) -> Tuple[int, Dict[str, Any], str]:
+              timeout: int = 20, proxy_enabled: bool = False,
+              proxy_url: str = DEFAULT_PROXY) -> Tuple[int, Dict[str, Any], str]:
     data = None
     headers = {
         "Accept": "application/json",
@@ -438,7 +490,7 @@ def http_json(method: str, url: str, api_key: str, body: Optional[Dict[str, Any]
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
-    opener = urllib_opener(no_proxy)
+    opener = urllib_opener(proxy_enabled, proxy_url)
     try:
         with opener.open(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
@@ -458,9 +510,11 @@ def http_json(method: str, url: str, api_key: str, body: Optional[Dict[str, Any]
         raise CXError(str(e))
 
 
-def fetch_models(base_url: str, api_key: str, no_proxy: bool = False) -> List[str]:
+def fetch_models(base_url: str, api_key: str, proxy_enabled: bool = False,
+                 proxy_url: str = DEFAULT_PROXY) -> List[str]:
     url = api_url(base_url, "/models")
-    status, js, raw = http_json("GET", url, api_key, timeout=25, no_proxy=no_proxy)
+    status, js, raw = http_json("GET", url, api_key, timeout=25,
+                                proxy_enabled=proxy_enabled, proxy_url=proxy_url)
     if status < 200 or status >= 300:
         msg = ""
         if isinstance(js, dict):
@@ -488,7 +542,8 @@ def fetch_models(base_url: str, api_key: str, no_proxy: bool = False) -> List[st
     return out
 
 
-def test_model(base_url: str, api_key: str, model: str, wire_api: str, no_proxy: bool = False) -> str:
+def test_model(base_url: str, api_key: str, model: str, wire_api: str,
+               proxy_enabled: bool = False, proxy_url: str = DEFAULT_PROXY) -> str:
     if not model:
         raise CXError("模型不能为空")
     if wire_api == "chat":
@@ -505,7 +560,8 @@ def test_model(base_url: str, api_key: str, model: str, wire_api: str, no_proxy:
             "input": "ping",
             "max_output_tokens": 8,
         }
-    status, js, raw = http_json("POST", url, api_key, body=body, timeout=35, no_proxy=no_proxy)
+    status, js, raw = http_json("POST", url, api_key, body=body, timeout=35,
+                                proxy_enabled=proxy_enabled, proxy_url=proxy_url)
     if 200 <= status < 300:
         return f"HTTP {status} OK"
     msg = ""
@@ -731,10 +787,11 @@ def choose_model(stdscr: Any, models: Sequence[str], default: str = "") -> Optio
     return models[model_idx]
 
 
-def edit_provider_flow(stdscr: Any, store: Dict[str, Any], index: Optional[int], no_proxy: bool) -> None:
+def edit_provider_flow(stdscr: Any, store: Dict[str, Any], index: Optional[int]) -> None:
     providers: List[Dict[str, Any]] = store.setdefault("providers", [])
     old: Dict[str, Any] = providers[index] if index is not None else {}
     is_edit = index is not None
+    settings = get_settings(store)
 
     name = prompt(stdscr, "提供商名称", default=old.get("name") or "", allow_empty=False)
     if name is None:
@@ -757,9 +814,9 @@ def edit_provider_flow(stdscr: Any, store: Dict[str, Any], index: Optional[int],
 
     models: List[str] = []
     fetch_note = ""
-    message(stdscr, "正在获取模型", f"GET {api_url(base, '/models')}\n代理: {'禁用' if no_proxy else DEFAULT_PROXY}", pause=False)
+    message(stdscr, "正在获取模型", f"GET {api_url(base, '/models')}\n代理: {proxy_label(settings)}", pause=False)
     try:
-        models = fetch_models(base, api_key, no_proxy=no_proxy)
+        models = fetch_models(base, api_key, proxy_enabled=settings["proxy_enabled"], proxy_url=settings["proxy_url"])
         fetch_note = f"获取到 {len(models)} 个模型。"
     except Exception as e:
         fetch_note = f"获取 /models 失败：{e}"
@@ -775,9 +832,10 @@ def edit_provider_flow(stdscr: Any, store: Dict[str, Any], index: Optional[int],
 
     if confirm(stdscr, "是否测试连通性？", f"模型: {model}\n格式: {wire}\n{fetch_note}"):
         endpoint = "/chat/completions" if wire == "chat" else "/responses"
-        message(stdscr, "正在测试模型", f"POST {api_url(base, endpoint)}\n代理: {'禁用' if no_proxy else DEFAULT_PROXY}", pause=False)
+        message(stdscr, "正在测试模型", f"POST {api_url(base, endpoint)}\n代理: {proxy_label(settings)}", pause=False)
         try:
-            ok = test_model(base, api_key, model, wire, no_proxy=no_proxy)
+            ok = test_model(base, api_key, model, wire,
+                            proxy_enabled=settings["proxy_enabled"], proxy_url=settings["proxy_url"])
             message(stdscr, "测试成功", ok)
         except Exception as e:
             if not confirm(stdscr, "测试失败，仍然保存吗？", str(e)):
@@ -820,14 +878,16 @@ def delete_provider_flow(stdscr: Any, store: Dict[str, Any]) -> None:
     message(stdscr, "已删除")
 
 
-def refresh_models_flow(stdscr: Any, store: Dict[str, Any], no_proxy: bool) -> None:
+def refresh_models_flow(stdscr: Any, store: Dict[str, Any]) -> None:
     chosen = choose_provider(stdscr, store, "选择要刷新模型的提供商")
     if not chosen:
         return
     idx, p = chosen
-    message(stdscr, "正在获取模型", f"GET {api_url(p.get('base_url') or '', '/models')}", pause=False)
+    settings = get_settings(store)
+    message(stdscr, "正在获取模型", f"GET {api_url(p.get('base_url') or '', '/models')}\n代理: {proxy_label(settings)}", pause=False)
     try:
-        models = fetch_models(p.get("base_url") or "", p.get("api_key") or "", no_proxy=no_proxy)
+        models = fetch_models(p.get("base_url") or "", p.get("api_key") or "",
+                              proxy_enabled=settings["proxy_enabled"], proxy_url=settings["proxy_url"])
         model = choose_model(stdscr, models, default=p.get("default_model") or "")
         if model:
             p["models_cache"] = models
@@ -839,11 +899,12 @@ def refresh_models_flow(stdscr: Any, store: Dict[str, Any], no_proxy: bool) -> N
         message(stdscr, "刷新失败", str(e))
 
 
-def test_provider_flow(stdscr: Any, store: Dict[str, Any], no_proxy: bool) -> None:
+def test_provider_flow(stdscr: Any, store: Dict[str, Any]) -> None:
     chosen = choose_provider(stdscr, store, "选择要测试的提供商")
     if not chosen:
         return
     _, p = chosen
+    settings = get_settings(store)
     models = p.get("models_cache") or []
     model = choose_model(stdscr, models, default=p.get("default_model") or "") if models else prompt(stdscr, "输入测试模型", default=p.get("default_model") or "", allow_empty=False)
     if not model:
@@ -851,8 +912,9 @@ def test_provider_flow(stdscr: Any, store: Dict[str, Any], no_proxy: bool) -> No
     try:
         wire = p.get("wire_api") or "responses"
         endpoint = "/chat/completions" if wire == "chat" else "/responses"
-        message(stdscr, "正在测试模型", f"{p.get('name')} / {model}\nPOST {api_url(p.get('base_url') or '', endpoint)}", pause=False)
-        ok = test_model(p.get("base_url") or "", p.get("api_key") or "", model, wire, no_proxy=no_proxy)
+        message(stdscr, "正在测试模型", f"{p.get('name')} / {model}\nPOST {api_url(p.get('base_url') or '', endpoint)}\n代理: {proxy_label(settings)}", pause=False)
+        ok = test_model(p.get("base_url") or "", p.get("api_key") or "", model, wire,
+                        proxy_enabled=settings["proxy_enabled"], proxy_url=settings["proxy_url"])
         message(stdscr, "测试成功", ok)
     except Exception as e:
         message(stdscr, "测试失败", str(e))
@@ -911,28 +973,55 @@ def switch_model_flow(stdscr: Any, store: Dict[str, Any]) -> None:
         message(stdscr, "切换模型失败", str(e))
 
 
-def manage_flow(stdscr: Any, store: Dict[str, Any], no_proxy: bool) -> None:
+def settings_flow(stdscr: Any, store: Dict[str, Any]) -> None:
+    while True:
+        settings = get_settings(store)
+        toggle = "禁用代理" if settings["proxy_enabled"] else "启用代理"
+        opts = [
+            toggle,
+            "修改代理地址",
+            "返回",
+        ]
+        subtitle = f"代理状态: {proxy_label(settings)}\n默认代理: {DEFAULT_PROXY}"
+        idx = select_menu(stdscr, "设置", opts, subtitle)
+        if idx is None or idx == 2:
+            return
+        if idx == 0:
+            settings = update_settings(store, proxy_enabled=not settings["proxy_enabled"])
+            message(stdscr, "设置已保存", f"代理状态: {proxy_label(settings)}")
+        elif idx == 1:
+            value = prompt(stdscr, "输入代理地址", default=settings["proxy_url"], allow_empty=False)
+            if value is None:
+                continue
+            try:
+                settings = update_settings(store, proxy_url=value)
+                message(stdscr, "设置已保存", f"代理地址: {settings['proxy_url']}\n代理状态: {proxy_label(settings)}")
+            except Exception as e:
+                message(stdscr, "保存失败", str(e))
+
+
+def manage_flow(stdscr: Any, store: Dict[str, Any]) -> None:
     while True:
         opts = ["添加提供商", "编辑提供商", "删除提供商", "刷新 /models 并选择模型", "测试模型连通性", "返回"]
         idx = select_menu(stdscr, "管理提供商", opts)
         if idx is None or idx == 5:
             return
         if idx == 0:
-            edit_provider_flow(stdscr, store, None, no_proxy)
+            edit_provider_flow(stdscr, store, None)
         elif idx == 1:
             chosen = choose_provider(stdscr, store, "选择要编辑的提供商")
             if chosen:
-                edit_provider_flow(stdscr, store, chosen[0], no_proxy)
+                edit_provider_flow(stdscr, store, chosen[0])
         elif idx == 2:
             delete_provider_flow(stdscr, store)
         elif idx == 3:
-            refresh_models_flow(stdscr, store, no_proxy)
+            refresh_models_flow(stdscr, store)
         elif idx == 4:
-            test_provider_flow(stdscr, store, no_proxy)
+            test_provider_flow(stdscr, store)
         store.update(load_store())
 
 
-def main_ui(no_proxy: bool = False) -> int:
+def main_ui() -> int:
     locale.setlocale(locale.LC_ALL, "")
     store = load_store()
 
@@ -947,16 +1036,19 @@ def main_ui(no_proxy: bool = False) -> int:
             active_id = detected_active_provider_id(store)
             active_name = next((p.get("name") for p in providers if p.get("id") == active_id), "未设置")
             model_name = current_config_model() or "未设置"
-            subtitle = f"当前 provider: {active_name} | 当前模型: {model_name} | provider 数: {len(providers)} | 代理: {'禁用' if no_proxy else DEFAULT_PROXY}"
-            idx = select_menu(stdscr, "Codex 接入点管理工具 cx", ["切换提供商", "管理提供商", "切换模型", "退出"], subtitle)
-            if idx is None or idx == 3:
+            settings = get_settings(store)
+            subtitle = f"当前 provider: {active_name} | 当前模型: {model_name} | provider 数: {len(providers)} | 代理: {proxy_label(settings)}"
+            idx = select_menu(stdscr, "Codex 接入点管理工具 cx", ["切换提供商", "管理提供商", "切换模型", "设置", "退出"], subtitle)
+            if idx is None or idx == 4:
                 return 0
             if idx == 0:
                 switch_flow(stdscr, store)
             elif idx == 1:
-                manage_flow(stdscr, store, no_proxy)
+                manage_flow(stdscr, store)
             elif idx == 2:
                 switch_model_flow(stdscr, store)
+            elif idx == 3:
+                settings_flow(stdscr, store)
             store.update(load_store())
     return curses.wrapper(_run)
 
@@ -990,26 +1082,29 @@ def provider_by_num(num: str) -> Dict[str, Any]:
     return providers[idx]
 
 
-def launch_codex(no_proxy: bool, passthrough: Sequence[str]) -> int:
+def launch_codex(settings: Dict[str, Any], passthrough: Sequence[str]) -> int:
     codex = shutil.which("codex")
     if not codex:
         raise CXError("找不到 codex 命令，请先安装 Codex CLI")
     passthrough = list(passthrough)
     if passthrough[:1] == ["--"]:
         passthrough = passthrough[1:]
-    env = proxy_env(no_proxy=no_proxy)
-    proxy_msg = "禁用代理" if no_proxy else f"代理 {DEFAULT_PROXY}"
+    settings = get_settings({"settings": settings})
+    env = proxy_env(proxy_enabled=settings["proxy_enabled"], proxy_url=settings["proxy_url"])
+    proxy_msg = f"代理 {settings['proxy_url']}" if settings["proxy_enabled"] else "禁用代理"
     print(f"启动 codex（{proxy_msg}）…", file=sys.stderr)
     os.execvpe(codex, ["codex", *passthrough], env)
     return 0
 
 
-def noninteractive_switch(provider_num: Optional[str], start_codex: bool, no_proxy: bool, passthrough: Sequence[str]) -> int:
+def noninteractive_switch(provider_num: Optional[str], start_codex: bool, passthrough: Sequence[str]) -> int:
+    store_for_settings = load_store()
+    settings = get_settings(store_for_settings)
     if provider_num is None:
         if start_codex:
             # In a TTY, let user select; otherwise fail with a clear message.
             if sys.stdin.isatty() and sys.stdout.isatty():
-                store = load_store()
+                store = store_for_settings
                 selected_holder: Dict[str, Any] = {}
 
                 def _pick(stdscr: Any) -> int:
@@ -1025,14 +1120,14 @@ def noninteractive_switch(provider_num: Optional[str], start_codex: bool, no_pro
             else:
                 raise CXError("--start-codex 非交互模式需要 --provider N")
         else:
-            return main_ui(no_proxy=no_proxy)
+            return main_ui()
     else:
         p = provider_by_num(provider_num)
 
     switch_provider(p)
     print(f"已切换到 provider: {p.get('name') or p.get('id')}（仅更新 OPENAI_API_KEY 和 base_url）", file=sys.stderr)
     if start_codex:
-        return launch_codex(no_proxy=no_proxy, passthrough=passthrough)
+        return launch_codex(settings=settings, passthrough=passthrough)
     return 0
 
 
@@ -1044,9 +1139,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--start-codex", action="store_true", help="切换后直接启动 codex")
     p.add_argument("--provider", metavar="N", help="选择第 N 个 provider（从 cx --list 查看）")
-    p.add_argument("--no-proxy", action="store_true", help="不使用默认代理，也会清理启动 codex 时的代理环境变量")
+    p.add_argument("--enable-proxy", metavar="BOOL", type=parse_bool,
+                   help="启用/禁用代理并保存到设置：true/false、1/0、yes/no、on/off")
     p.add_argument("--list", action="store_true", help="列出已保存 provider")
-    p.add_argument("--version", action="version", version="cx 1.0")
+    p.add_argument("--version", action="version", version="cx 1.1")
     return p
 
 
@@ -1054,11 +1150,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_arg_parser()
     args, passthrough = parser.parse_known_args(argv)
     try:
+        if args.enable_proxy is not None:
+            store = load_store()
+            settings = update_settings(store, proxy_enabled=args.enable_proxy)
+            print(f"代理设置已保存: {proxy_label(settings)}", file=sys.stderr)
         if args.list:
             return list_providers()
         if args.provider or args.start_codex:
-            return noninteractive_switch(args.provider, args.start_codex, args.no_proxy, passthrough)
-        return main_ui(no_proxy=args.no_proxy)
+            return noninteractive_switch(args.provider, args.start_codex, passthrough)
+        return main_ui()
     except KeyboardInterrupt:
         print("\n已取消", file=sys.stderr)
         return 130

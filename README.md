@@ -1,6 +1,6 @@
 # provider-manager
 
-`provider-manager` 是一个零依赖的 Codex CLI 接入点管理工具，命令名为 `cx`。它可以交互式管理多个 OpenAI-compatible provider，快速切换 Codex 使用的 `base_url` / `OPENAI_API_KEY`，并单独切换模型。
+`provider-manager` 是一个零依赖的 Codex CLI 接入点管理工具，命令名为 `cx`。它可以交互式管理多个 OpenAI-compatible provider，快速切换 Codex 使用的 `base_url` / `OPENAI_API_KEY`，单独切换模型，并记忆代理设置。
 
 ## 功能
 
@@ -9,14 +9,16 @@
   1. 切换提供商
   2. 管理提供商
   3. 切换模型
+  4. 设置
 - Provider 管理：添加、编辑、删除、刷新 `/models`、选择模型、测试连通性。
+- 设置：启用/禁用代理，修改代理地址；设置会保存到 `~/.codex/providers.json`。
 - `base_url` 自动补齐 `/v1`：
   - 输入 `https://api.example.com` 会保存/写入为 `https://api.example.com/v1`
   - 输入已带 `/v1` 的地址不会重复追加
 - 自动调用 `GET /v1/models` 获取模型列表。
 - 可手动输入 custom 模型名。
-- 默认代理：`http://192.168.3.54:7893`
-- `--no-proxy` 可禁用代理。
+- 默认代理地址：`http://127.0.0.1:7890/`
+- 代理默认不启用；直接运行 `cx` 时会使用上次在“设置”中保存的记忆配置。
 
 ## 重要行为
 
@@ -34,7 +36,7 @@
 - `wire_api`
 - 其它 TOML/JSON 字段
 - 不新增或删除 Codex provider section
-- 不改写 `~/.codex/providers.json`
+- 不改写 provider 列表；只有修改“设置”时才会保存设置
 
 ### 切换模型
 
@@ -45,6 +47,24 @@ model = "your-model"
 ```
 
 不会修改 provider、key、base_url 或其它字段。
+
+### 代理设置
+
+代理配置保存在 `~/.codex/providers.json` 的 `settings` 字段中：
+
+```json
+{
+  "settings": {
+    "proxy_enabled": false,
+    "proxy_url": "http://127.0.0.1:7890/"
+  }
+}
+```
+
+- 默认 `proxy_enabled = false`
+- 默认 `proxy_url = "http://127.0.0.1:7890/"`
+- `cx` 交互启动、刷新模型、测试连通性、`--start-codex` 都会读取该记忆配置
+- CLI 可用 `--enable-proxy true|false` 修改并保存代理开关
 
 ## 安装
 
@@ -80,22 +100,34 @@ cx
 cx --list
 ```
 
+启用代理并保存设置：
+
+```bash
+cx --enable-proxy true
+```
+
+禁用代理并保存设置：
+
+```bash
+cx --enable-proxy false
+```
+
 切换到第 1 个 provider：
 
 ```bash
 cx --provider 1
 ```
 
-切换到第 1 个 provider 后直接启动 Codex，默认使用代理：
+切换到第 1 个 provider 后直接启动 Codex，代理行为使用设置中的记忆配置：
 
 ```bash
 cx --start-codex --provider 1
 ```
 
-不使用代理启动 Codex：
+临时先保存代理开关，再启动 Codex：
 
 ```bash
-cx --start-codex --provider 1 --no-proxy
+cx --enable-proxy true --start-codex --provider 1
 ```
 
 透传参数给原始 `codex`：
@@ -106,7 +138,7 @@ cx --start-codex --provider 1 -- --help
 
 ## 数据文件
 
-Provider 列表保存在：
+Provider 列表和工具设置保存在：
 
 ```text
 ~/.codex/providers.json
