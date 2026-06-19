@@ -16,6 +16,7 @@
   - 输入 `https://api.example.com` 会保存/写入为 `https://api.example.com/v1`
   - 输入已带 `/v1` 的地址不会重复追加
 - 自动调用 `GET /v1/models` 获取模型列表。
+- 模型连通性测试只使用 Codex 支持的 Responses API：`POST /v1/responses`；不再支持 Chat Completions `/v1/chat/completions`。
 - 可手动输入 custom 模型名。
 - 默认代理地址：`http://127.0.0.1:7890/`
 - 代理默认不启用；直接运行 `cx` 时会使用上次在“设置”中保存的记忆配置。
@@ -33,7 +34,7 @@
 
 - `model`
 - `model_provider`
-- `wire_api`
+- `wire_api`（请确保 Codex 配置本身使用 `responses`）
 - 其它 TOML/JSON 字段
 - 不新增或删除 Codex provider section
 - 不改写 provider 列表；只有修改“设置”时才会保存设置
