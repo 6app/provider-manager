@@ -1150,10 +1150,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_arg_parser()
     args, passthrough = parser.parse_known_args(argv)
     try:
+        if any(x == "--no-proxy" or x.startswith("--no-proxy=") for x in passthrough):
+            parser.error("--no-proxy 已删除，请改用 --enable-proxy true|false")
+        if passthrough and not args.start_codex:
+            parser.error("未知参数: " + " ".join(passthrough))
         if args.enable_proxy is not None:
             store = load_store()
             settings = update_settings(store, proxy_enabled=args.enable_proxy)
             print(f"代理设置已保存: {proxy_label(settings)}", file=sys.stderr)
+            if not args.list and not args.provider and not args.start_codex:
+                return 0
         if args.list:
             return list_providers()
         if args.provider or args.start_codex:
